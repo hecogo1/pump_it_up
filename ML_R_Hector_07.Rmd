@@ -1,0 +1,457 @@
+---
+title: "Pump it Up: Grupo 4"
+author: "Héctor Cózar Gordo"
+date: "12/03/2022"
+output: rmdformats::downcute
+editor_options: 
+  chunk_output_type: online
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# **1. Presentación del trabajo.**
+
+El trabajo de este módulo consiste en participar en una competición. Esta competición puede encontrarse en la web **https://www.drivendata.org/competitions/7/pump-it-up-data-mining-the-water-table**.  Los datos de la competición provienen de **Taarifa** (una plataforma open-source), son datos que provienen del ministerio de agua de Tanzania
+
+El objetivo de la competición es predecir la condición de operación de los puntos de agua para cada registro del conjunto de datos. Para cada uno de esos registros se añade información sobre los puntos de agua.
+
+La métrica usada en esta competición es el ratio de clasificación, el cual se calcula con el porcentaje de filas donde la clase predicha en el archivo subido coincide con la clase real en el conjunto de test. El valor máximo es 1 y el valor mínimo es 0. El objetivo es maximizar el ratio de clasificación.
+
+Esto con el objetivo de predecir que puntos de agua necesitarán o no reparaciones para que los ciudadanos de Tanzania puedas tener siempre disponible agua potable.
+
+La descrición expuesta en los parrafos anteriores puede encontrarse en la web en ingles.
+
+
+## **1.2 Librerías.**
+
+Nótese que he dejado librerias que no se usan solo para poder tenerlas en cuenta para futuros projectos.
+
+```{r, warning = FALSE, message=FALSE}
+
+library(dplyr)       # Data Manipulation
+library(data.table)  # Fast Data Manipulation
+library(inspectdf)   # EDAs automatic
+library(ranger)      # Fast randomForest
+library(tictoc)      # Measure execution time
+library(magrittr)    # Piping mode
+library(ggplot2)     # Very nice charts 
+library(forcats)     # Manage factor variables
+library(tibble)      # Compact dataframe
+library(missRanger)  # Impute with randomForest
+library(stringi)     # Fast string manipulation
+library(h2o)         # To use automl and other usuful fuctions
+library(tools)       # To get the name of R script
+library(rstudioapi)  # To get the name of R script
+library(xgboost)
+```
+
+## **1.3 Carga de datos.**
+
+Los datos viene en tres archivos diferentes:
+
+- **datos de entrenamiento**: Los datos que vamos a usar para entrenar el modelo.
+- **datos de test**: Los datos que vamos a utilizar para generar las predicciónes que luego subiremos a la plataforma
+- **etiquetas**: La variable objetivo junto con el id que pertenecen al conjunto de training.
+
+```{r, Carga de datos, warning = FALSE }
+
+datTrainOri    <- as.data.frame(fread("./data/train.csv", nThread = 3))
+datTrainOrilab <- fread("./data/train_labels.csv", nThread = 3, data.table = FALSE )
+datTestOri     <- fread("./data/test.csv", nThread = 3, data.table = FALSE)
+```
+
+# **2. EDA (Exploratory Data Analysis).**
+
+Utilizamos el paquete **inspect_df** para sacar un analisis descriptivo de las variables del test.
+
+```{r EDA, warning = FALSE}
+#  categóricas que pueden dar señal
+x <- inspect_cat(datTestOri) 
+show_plot(x)
+
+#Correlación entre variables numéricas e intervalos de confianza de esa correlación 
+x <- inspect_cor(datTestOri)
+show_plot(x)
+
+# Bar plot con llas categorías más frecuentes de las variables categóricas
+x <- inspect_imb(datTestOri)
+show_plot(x)
+
+# Numero de NAs en cada variable ordenado el orden descendente
+x <- inspect_na(datTestOri)
+show_plot(x)
+
+# Histogramas para las variables categóricas en test
+x <- inspect_num(datTestOri)
+show_plot(x)
+
+# Barplot del tipo de cada columna del conjunto de test 
+x <- inspect_types(datTestOri)
+show_plot(x)
+```
+
+Los añalisis descriptivos los vamos a hacer sobre la variable test para tener en cuenta a la hora de predecir datos que variables podemos eliminar. De nada nos serviría hacer un EDA al conjunto de trianing y luego no poder aplicar nuestro modelo porque no se correspode con la distrubución de los datos en el conjunto de Test.
+
+En cuanto a las variables categóricas sigo los caminos que utilizamos en clase y que usaron los compañeros que ganaron el concurso. Variables categóricas con muchos niveles que pueden reducirse son: **lga**,**installer**, **scheme_name**,**scheme_management**,**ward**,**subvillage** y **wpt_name**. Sin embargo, en mi modelo de todas estas variables solo me aportaban información las variables **lga**, **installer** y **scheme_name**.
+
+Por otro lado, me he fijado en variables que podría eliminar. La variable **recorded_by** es una constante y por lo tanto podemos quitarla del modelo.
+
+Además y aunque no aparece en las variables con NAs porque estan configuradas como numéricas, vamos a eliminar las variables: **amount_tsh**, **num_private**, **population**. Ya que el valor 0 se dan en el torno al 90% de los valores. Por lo tanto, o tenemos muchos valores perdidos o tenemos muchos valores en la misma categoría. El modelo mejora muy poco. Pero teniendo en cuenta que estoy controlando las semillas me parece relevante eliminarlas del modelo.
+
+
+# **3. Preprocesado.**
+
+Para la primera parte del procesado de datos vamos a juntar ambos conjuntos de datos en uno. Así aplicaremos todos los cambios de una vez. 
+
+Transformamos las variables que necesitamos a tipo factor para que H2O pueda usarlas. Las variables lógicas las transformamos a factores. Por último, como hemos comentado anteriormente, quitamos las variables con información redundante.
+ 
+```{r selección variables, warning = FALSE, results='hide'}
+
+# Pegamos las etiquetas con el nombre de las variables
+datTrainTarget = datTrainOri %>% 
+  left_join(datTrainOrilab)
+
+# La target la pasamos a tipo factor 
+datTrainTarget %<>% 
+  mutate(status_group = as.factor(status_group))
+
+#Join de train y de test para la imputación
+datAll <- rbind(datTrainOri, datTestOri)
+
+# Selecciono las lógicas y las transformo a Factores
+datGd <- datAll %>% 
+  mutate_if(is.logical, as.factor)
+
+#Eliminamos recorded_by ya que es una constante, tambien eliminamos variables que tienen más del 80% de valores 0
+datGd %<>% select(-c(recorded_by, amount_tsh, num_private, population))
+```
+
+## **3.1 Imputación de valores perdidos.**
+
+Vamos a utilizar **missRanger** para imputar los datos mediante árboles de decisión. Una solución más elaborada que una sustitución por la media. 
+
+En este caso y como hemos visto en el EDA solo se van a imputar las variables **public_meeting** y **permit**. El resto de variables tiene "aparentemente" todos los valores completos.
+
+
+**Nota:** Es incrible que cambiando la semilla de la imputación suba hasta 0.005 puntos en la predicción. El otro valor que tomaba era "1234". Pongo la semilla también para que se pueda reproducir el código.
+
+```{r imputacion, results='hide'}
+
+datGdImputed <- missRanger(datGd, pmm.k = 3, num.trees = 100, seed = 546345635)  
+``` 
+
+## **3.2 Lumping.**
+
+He recogido el lumping que aplicaron los compañeros y lo he usado en la medida en la que me beneficiaba en mi modelo. También he intentado aplicar el lumping a más variables pero al igual que en los otros casos no he conseguido mejorar el modelo sino que empeorarlo. 
+
+De hecho, mi modelo mejoraba quitando algunas de las variables que usaron los compañeros en el modelo ganador. También sea dicho, que no se exactamente que hicieron los compañeros del grupo ganador ya que una de las variables hacía ilegible el dataframe y aún así consiguieron la mayor puntuación. Por lo tanto, puede ser que esa variable que no he conseguido descifrar sea la que más información les daba, pero como ya digo, debaja el dataframe sin poder visualizarse.
+
+
+## **3.2.1 Variable lga.**
+
+125 niveles. Añadimos la variable, cambiamos a minúsculas y quitamos los espacios. Hacemos lumping para quedarnos con 50 categorías.
+
+```{r lga, message=FALSE, warning=FALSE}
+
+lga_trts <- c(datTrainOri$lga, datTestOri$lga)
+datGdImputed %<>%
+  mutate(lga = lga_trts) %>%
+  mutate(lga = stri_trans_tolower(lga)) %>%
+  mutate(lga = stri_replace_all_fixed(lga, " ", "")) %>%
+  mutate(lga = fct_lump_n(lga, n = 50))
+```
+
+## **3.2.2 Variable installer.**
+
+2411 niveles. Añadimos la variable, cambiamos a minúsculas, quitamos espacios y sustituimos los "0" y los "not known" por "Desconocido". Vemos también que en algunos registros no hay datos. Los sustiruimos por "Desconocido". Hacemos lumping para quedarnos con 200 categorías.
+
+```{r installer, message=FALSE, warning=FALSE}
+
+installer_trts <- c(datTrainOri$installer, datTestOri$installer)
+datGdImputed %<>%
+  mutate(installer = installer_trts) %>%
+  mutate(installer = stri_trans_tolower(installer)) %>%
+  mutate(installer = ifelse(nchar(installer) == 0, "Desconocido", installer)) %>%
+  mutate(installer = stri_replace_all_fixed(installer, c("0", "Not known"), c("Desconocido"), vectorize_all = FALSE)) %>%
+  mutate(installer = stri_replace_all_fixed(installer, " ", "")) %>%
+  mutate(installer = fct_lump_n(installer, n = 200))
+```
+
+## **3.2.3 Variable scheme_name.**
+
+2869 niveles. Añadimos la variable, cambiamos a minúsculas, quitamos espacios y sustituimos los "0", los "none" y los registros sin datos por "Desconocido". Hacemos lumping para quedarnos con 250 categorías.
+
+```{r scheme_name, message=FALSE, warning=FALSE}
+
+scheme_name_trts <- c(datTrainOri$scheme_name, datTestOri$scheme_name)
+datGdImputed %<>%
+  mutate(scheme_name = scheme_name_trts) %>%
+  mutate(scheme_name = stri_trans_tolower(scheme_name)) %>%
+  mutate(scheme_name = ifelse(nchar(scheme_name) == 0, "Desconocido", scheme_name)) %>%
+  mutate(scheme_name = stri_replace_all_fixed(scheme_name, c("0", "None"), c("Desconocido"), vectorize_all = FALSE)) %>%
+  mutate(scheme_name = stri_replace_all_fixed(scheme_name, " ", "")) %>%
+  mutate(scheme_name = fct_lump_n(scheme_name, n = 250))
+```
+
+## **3.3 Nuevas variables - Feature Fngineering.**
+
+En mi modelo con H2O todas las variables que creamos en clase y las creadas en el modelo ganador de los compañeros solo empeoraban el modelo. Intenté alguna combinación más pero siempre encontraba lo mismo, añadir variables me causaba bajar el la predicción del modelo tanto en la validación como en concurso.
+
+Lo que si voy a mantener es la fecha como un factor para que H2O pueda usarla en el modelo.
+
+```{r fecha como factor, message=FALSE, warning=FALSE}
+
+datGdImputed$date_recorded %<>% as.factor()
+```
+
+## **3.4 Separación train y test.**
+
+Separamos de nuevo los conjuntos de train y de test. Además convertimos la variable objetivo a factor. Esto es necesario para H2O
+
+```{r train test}
+# Índice para dividirlo
+datGdImputed %<>%
+  mutate(miindice = 1:nrow(datGdImputed))
+
+# Train
+datGdTrain <- datGdImputed %>%
+  filter(miindice <= nrow(datTrainOri)) 
+
+# Test
+datGdTest <- datGdImputed %>%
+  filter(miindice > nrow(datTrainOri)) 
+
+datGdTrain %<>% select(-miindice)
+datGdTest  %<>% select(-miindice)
+
+# Pegar status_group
+datGdTrain$status_group <- as.factor(datTrainOrilab$status_group)  
+```
+
+# **4. Modelo - H2O.**
+
+Mi idea con esta práctica era entender el funcionamiento de H20. Me parece una herramienta espectacular y que hay que aprender a usar. He estado prácticando con ella con el problema clásico del Titanic donde he obtenido unos resultados decentes. Sin embargo, me he encontrado con varios problemas durante el uso de la herramienta en esta práctica.
+
+El primer problema me vino porque en algún momento H20 dejo de reconocer mi librería de XGBOOST (Tengo un Mac con chip M1 pro). No entiendo el motivo, he buscado por internet pero no he encontrado solución al problema. La mayoría de soluciones iban dirigidas a usuarios de python y el resto a usuarios de windows. Me temo que no he podido solucionarlo y por lo tanto el automl no será capaz de ejecutar modelos XGBOOST.
+
+Teniendo esto en cuenta, me dispongo a explicar los procesos que he realizado en H2O. En primer transformado las variables de tipo carácter o factores. H2O no funciona con variables de tipo carácter. También hay que tener en cuenta que la variable objetivo, en este caso "status_group" tiene que ser de tipo factor.
+
+```{r Getting ready data for H2o Automl}
+
+### H2O  Categorical variables needs to be factors, and integer will be numeric
+
+datGdTrain %<>% mutate_if(is.character, as.factor)
+datGdTest %<>% mutate_if(is.character, as.factor)
+
+datGdTrain %<>% mutate_if(is.integer, as.numeric)
+datGdTest %<>% mutate_if(is.integer, as.numeric)
+```
+
+## **4.1 Automl H2O.**
+
+Tras investigar y tener serios problemas con el tiempo que tardaban en ejecutarse los modelos hasta quedarse atascado y no acabar de ejecutarse, he ido jugando con las variables que me daba un modelo medio decente. 
+
+- **max_runtime_secs:** que es el número máximo de segundos que va a estar funcionando la función
+- **max_models:** que es el número máximo de modelos que se van a crear
+- **seed:** semilla para poder replicar el modelo
+- **training_frame:** set de training, que tiene que ser un objeto H2O.
+
+El set de training es importante. En un primer momento vamos a ir validando nuestro modelo con un un 80% de los datos de test, con el fin de poder validar los datos con el 20% restante. Sin embargo, cuando lo subamos a la plataforma el modelo se debe ejecutar con el set de training entero.
+
+En el trabajo se presenta ya directamente el entrenamiento con el set de training completo, pero quedan las trazas del código del split para que se pueda ver el proceso.
+
+```{r H2o Automl, warning=FALSE}
+
+## ---------------H2o----------------------
+
+#Iniciating H2o
+h2o.init(max_mem_size = "10g", nthreads = 8)
+
+# Not including progress H2O progress line
+h2o.no_progress()
+
+## Cleaning all h2o objects just in case.
+h2o.removeAll()
+
+#Loading data as a h2o object
+train_hex <- as.h2o(datGdTrain)
+test_hex <- as.h2o(datGdTest)
+
+# # Split for the first time, train and test just to show we can validate our test by.
+splits <- h2o.splitFrame(train_hex, ratios = 0.8, seed = 546345635)
+
+train <- splits[[1]]
+# test to validation
+valid <- splits[[2]]
+
+response <- "status_group"
+
+
+## Auto ML
+automl <- h2o.automl( x = c("id","date_recorded","funder","gps_height","installer","longitude",
+                            "latitude","wpt_name","basin","subvillage","region","region_code",
+                            "district_code","lga","ward","public_meeting",
+                            "scheme_management","scheme_name","permit","construction_year","extraction_type",
+                            "extraction_type_group","extraction_type_class","management","management_group",
+                            "payment","payment_type","water_quality","quality_group","quantity",
+                            "quantity_group","source","source_type","source_class","waterpoint_type",
+                            "waterpoint_type_group", "status_group"),
+                      y = response,
+                      training_frame = train_hex,
+                      project_name = NULL,
+                      max_runtime_secs = 60*60*4, #60 segundos por 60 minutos por 1 hora
+                      #balance_classes = TRUE,
+                      seed = 546345635
+                      #max_models = 50,
+                      #balance_classes = TRUE,
+                      #keep_cross_validation_predictions = TRUE # otherwise it returns an error with 100 models
+                       )
+```
+
+## **4.2 Modelo ganador.**
+
+Obtengo el modelo ganador y lo guardo para utilizarlo en mis predicciones más adelante.
+
+```{r Winner model}
+
+# Model name
+H2Omodel_name <- as.character(automl@leaderboard[1, 1])
+
+# Cogemos el mejor modelo del auto ML
+myH2Omodel <- h2o.getModel(automl@leaderboard[1, 1])
+```
+
+## **4.3 Métricas del modelo.**
+
+En este caso dejo el código con el que obetenía la precisión del modelo. Sin embargo, el modelo de este trabajo está ya entrenado sobre todo los datos de test y por lo tanto el valor de precisión aquí no tiene sentido. Ya que el conjunto de valided está incluido en el conjunto de training.
+
+```{r H2o Automl Metricas}
+# Performance del modelo
+mod_perf <- h2o.performance(myH2Omodel, valid)
+
+# Model error - Quita no funciona por no ser de clasificación??
+error <- h2o.mean_per_class_error(mod_perf)
+acc_val <- 1 - error
+
+# Importancia de las variables h2o
+var_imp <- h2o.varimp(myH2Omodel)
+
+acc_val
+```
+
+## **4.4 Predicciones.**
+
+Realizamos la predicción con el modelo que hemos generado y con el conjunto de test que se nos proporciona en la competición.
+
+Como se puede ver en el gráfico del apartado siguiente, el modelo ganador ha sido el GBM. Por lo tanto, vamos a poder explicar las variables.
+
+
+```{r H2o Automl Predicción, warning=FALSE}
+# Predict dentro de H2O
+pred_val <- h2o.predict(myH2Omodel, test_hex)
+
+# Traemos las predicciones de H2O a R
+pred_df <- as.data.frame(pred_val)
+```
+
+# **5. Importancia de las variables.**
+
+```{r H2o Automl Graficos Variables importantes}
+# Grafico variables importantes
+h2o.varimp_plot(myH2Omodel)
+```
+
+- **date_recorded:** la variable que más información aporta es la fecha en la que se introdujo el dato. No le veo ningun sentido, pero así es.
+- **quantity:** las bombas que tienen categoria *dry*, es decir las que están más secas tienden a presentar más bombas de agua no funcionales.
+- **installer:** las bombas instaladas por *dwe*, *otros* y *desconocido* son las que más bombas no funcionales presentan. Sin embargo, también son las que más bombas tienen instaladas.
+- **ward:** las bombas instaladas en *Mishamo* tienden a tener más bombas no funcionales. Hasta el doble más que la siguiente categoría con más funcionales que sería *Bungu*
+- **scheme_name:** las bombas clasificadas como *desconocidas* u *otras* son con diferencia las que más bombas no funcionales presentan. 
+- **extraction_type:** las clasificadas como *otro*, son las que tienden a presentar más bombas de agua no funcionales
+- **waterpoint_type_group:** las clasificadas como *otro*, son las que tienden a presentar más bombas de agua no funcionales
+- **funder:** las que más fallan son las instaladas por el *Gobierno de Tanzania* por una gran diferencia. Pero también son los que tienen más instaladas. Sin embargo, tienen un número mayor de no funcionales en función de las instaladas comparandolo con otras empresas que fundaron las bombas.
+- **lga:** la categoría que tiende a tener más bombas como no funcional es *otro* con una diferencia significativa al resto de categorias
+- **wpt_name:** las variables que mas tienden a necesitar reparación son, la que vienen de Shuleni, Zahanati, none y Msikitini. Sin embargo, tambien son las que más funcionales tienen, por lo que no se si tiene mucho sentido esta información
+
+```{r Apagamos H2O}
+# Cerramos H2
+h2o.shutdown()
+```
+
+
+# **6. Predicción y entrega.**
+
+Por último, realizamos la predicción en el conjunto de Test, y preparamos la entrega con el formato necesario para que la plataforma pueda evaluarlo correctamente.
+
+```{r Entrega}
+
+# Preparar entrega
+sub_df <- data.frame(
+  id = datTestOri$id,
+  status_group = pred_df$predict
+)
+
+# Script name
+name <- file_path_sans_ext(basename(getSourceEditorContext()$path))
+
+#-- Save submission
+fwrite(sub_df, 
+       paste0("./submissions/", name, "local_accu_", round(acc_val, 6), ".csv"),
+       nThread = 3
+)
+```
+
+# **7. Notas de los pasos relevantes seguidos en la consecución del modelo final.**
+
+#### **00. Variables originales sin cambios h2o 60seg**
+
+- Accuracy obtenido a nivel local: **0.6574747**
+- Puntuación en la web del concurso: **0.7864**
+
+#### **01. Variables originales con balanceado en H2o sin cambios.**
+- Accuracy obtenido a nivel local: **0.6395005**
+- Puntuación en la web del concurso: **0.7664**
+
+
+#### **02. Sin balanceo metiendo las variables del modelo ganador que mejoran el modelo con variables originales h2o 60seg - lumping lga, lumping installer y lumping scheme_name.**
+
+- Accuracy obtenido a nivel local: **0.6523674**
+- Puntuación en la web del concurso: **0.7994**
+
+Bueno en general vemos como incluyendo todos los cambios hechos por los compañeros en clase, los unicos que realmente mejoran mi modelo con el lumping de lga, installer y scheme_name. Vamos a ir con esto a la siguiente submission.
+
+#### **03. Usando todo el training, en este caso el accu local no tiene sentido interpretarlo h2o 60seg.**
+
+- Accuracy obtenido a nivel local: **0.8318789** - ENTRENADO CON SET DE VALID INCLUIDO
+- Puntuación en la web del concurso: **0.8022**
+
+#### **04. Usando todo test_split y h2o max_time 60 min.** 
+
+He estado jugando con automl en el dataset del titanic y me funcionó genial, pero por algún motivo aqui ni me deja utilizar xgboost (esto parece que ya me ocurre siempre, algo que ver con algo instalado) y además aunque ponga maxmodels 1 h2o automl tardá muchísimos y se queda atascado. He buscado información, pero no ha habido manera de encontrar informacion de H2o para R. Parece que la gente lo usa más en python.
+
+- Accuracy obtenido a nivel local: **0.6611666** 
+- Puntuación en la web del concurso: **0.8125**
+
+
+#### **05. Usando solo automl 2h train entero modelo 05.**
+
+- Todas con warning the target accu: **0.6601817**
+
+He probado a ir sacando variables del modelo para quitar ruido, pero en cada caso me bajaba la precisión con la validación. Como no ha funcionado el puesto el modelo 2 horas con automl con el training entero
+
+- Accuracy obtenido a nivel local: **0.9738842**  - ENTRENADO CON SET DE VALID INCLUIDO
+- Puntuación en la web del concurso: **0.8185**
+
+#### **06. Eliminando variables que no tienen sentido train entero modelo.**
+
+- recorded_by: es una constante
+- amount_tsh, num_private y population: tienen entorno a un 90% de valores perdidos o valores de una misma categoria
+
+- Accuracy obtenido a nivel local: **0.8342706** - ENTRENADO CON SET DE VALID INCLUIDO
+- Puntuación en la web del concurso: **0.8032**
+
+#### **07. Modelo de 4 horas más horas me da error por algun motivo que desconozco.**
+
+- Accuracy obtenido a nivel local: **0.9289148** - ENTRENADO CON SET DE VALID INCLUIDO
+- Puntuación en la web del concurso: **0.8160**
